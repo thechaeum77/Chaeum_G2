@@ -1,6 +1,7 @@
 (() => {
   const MESSAGE_TYPE_FETCH_FEED = "chaeum-g2-fetch-feed";
   const STORAGE_KEY_PENDING_INSPECT = "pendingInspectRequest";
+  const STORAGE_KEY_FEED_CACHE = "feedCacheByResource";
   const PANEL_ID = "chaeum-g2-panel";
   const STYLE_ID = "chaeum-g2-panel-style";
   const TOGGLE_BUTTON_ID = "chaeum-g2-toggle";
@@ -34,6 +35,38 @@
         savedAt: Date.now()
       }
     });
+  }
+
+  async function loadCachedFeedItems(site) {
+    try {
+      const stored = await chrome.storage.local.get(STORAGE_KEY_FEED_CACHE);
+      const cache = stored?.[STORAGE_KEY_FEED_CACHE];
+      const entry = cache?.[buildResourceId(site)];
+      if (!entry || !Array.isArray(entry.items)) return [];
+      return entry.items;
+    } catch {
+      return [];
+    }
+  }
+
+  async function saveCachedFeedItems(site, items) {
+    try {
+      const stored = await chrome.storage.local.get(STORAGE_KEY_FEED_CACHE);
+      const cache = stored?.[STORAGE_KEY_FEED_CACHE] && typeof stored[STORAGE_KEY_FEED_CACHE] === "object"
+        ? stored[STORAGE_KEY_FEED_CACHE]
+        : {};
+
+      cache[buildResourceId(site)] = {
+        items: Array.isArray(items) ? items.slice(0, 8) : [],
+        savedAt: Date.now()
+      };
+
+      await chrome.storage.local.set({
+        [STORAGE_KEY_FEED_CACHE]: cache
+      });
+    } catch {
+      // Ignore cache persistence failures.
+    }
   }
 
   function isTargetUrlCompatible(site, targetUrl) {
@@ -522,7 +555,7 @@
     }
   }
 
-  function renderSites(panel, sites) {
+  async function renderSites(panel, sites) {
     const listEl = panel.querySelector(".cg2-list");
     const inputEl = panel.querySelector("#cg2-target-url");
     if (!listEl || !inputEl) return;
@@ -556,6 +589,14 @@
       card.querySelector(".cg2-site-title").textContent = site.label || site.propertyValue;
       card.querySelector(".cg2-site-meta").textContent =
         `${site.propertyType === "domain" ? "도메인 속성" : "URL 접두어"} | ${site.propertyValue}`;
+      const feedListEl = card.querySelector(".cg2-feed-list");
+
+      if (feedListEl) {
+        const cachedItems = await loadCachedFeedItems(site);
+        if (cachedItems.length > 0) {
+          renderFeedItems(feedListEl, inputEl, panel, cachedItems);
+        }
+      }
 
       card.querySelector(".cg2-site-button")?.addEventListener("click", async () => {
         const targetUrl = sanitizeText(inputEl.value);
@@ -587,7 +628,6 @@
 
       card.querySelector(".cg2-feed-button")?.addEventListener("click", async event => {
         const button = event.currentTarget;
-        const feedListEl = card.querySelector(".cg2-feed-list");
         if (!(button instanceof HTMLButtonElement) || !feedListEl) return;
 
         button.disabled = true;
@@ -605,6 +645,7 @@
           }
 
           renderFeedItems(feedListEl, inputEl, panel, items);
+          await saveCachedFeedItems(site, items);
           setStatus(panel, `RSS 최신 글 ${items.length}개를 불러왔습니다.`);
         } catch {
           feedListEl.innerHTML = `<div class="cg2-feed-empty">RSS를 불러오지 못했습니다.</div>`;
@@ -642,17 +683,17 @@
       }
 
       const sites = await loadSites();
-      renderSites(panel, sites);
+      await renderSites(panel, sites);
     };
 
     await refreshPanel();
 
     chrome.storage.onChanged.addListener((changes, areaName) => {
-      if (areaName !== "sync") return;
-      if (!changes[STORAGE_KEY_SITES] && !changes[LEGACY_STORAGE_KEY]) return;
+      if (areaName !== "local") return;
+      if (!changes[STORAGE_KEY_FEED_CACHE]) return;
 
       refreshPanel()
-        .catch(() => setStatus(panel, "저장된 목록을 새로고침하지 못했습니다.", true));
+        .catch(() => setStatus(panel, "RSS 목록을 새로고침하지 못했습니다.", true));
     });
 
     let lastHref = window.location.href;
