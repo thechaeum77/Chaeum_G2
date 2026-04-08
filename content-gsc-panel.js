@@ -2,6 +2,7 @@
   const MESSAGE_TYPE_FETCH_FEED = "chaeum-g2-fetch-feed";
   const STORAGE_KEY_PENDING_INSPECT = "pendingInspectRequest";
   const STORAGE_KEY_FEED_CACHE = "feedCacheByResource";
+  const STORAGE_KEY_INSPECTION_HISTORY = "inspectionHistoryByUrl";
   const PANEL_ID = "chaeum-g2-panel";
   const STYLE_ID = "chaeum-g2-panel-style";
   const TOGGLE_BUTTON_ID = "chaeum-g2-toggle";
@@ -9,6 +10,7 @@
   const INSPECT_BUTTON_FOCUS_CLASS = "cg2-site-button-focus";
   const FEED_PAGE_SIZE = 10;
   const FEED_CACHE_LIMIT = 200;
+  const INSPECTION_HISTORY_TTL_MS = 90 * 24 * 60 * 60 * 1000;
   const feedStateByResource = new Map();
 
   function sanitizeText(value) {
@@ -19,6 +21,65 @@
     return String(value || "")
       .toLowerCase()
       .replace(/\s+/g, "");
+  }
+
+  function normalizeUrlForHistory(value) {
+    try {
+      const parsed = new URL(String(value || ""));
+      parsed.hash = "";
+      return parsed.href;
+    } catch {
+      return "";
+    }
+  }
+
+  function pruneInspectionHistoryRecords(historyByUrl) {
+    const now = Date.now();
+    const history = historyByUrl && typeof historyByUrl === "object"
+      ? { ...historyByUrl }
+      : {};
+    let changed = false;
+
+    for (const [urlKey, entry] of Object.entries(history)) {
+      const checkedAt = Number(entry?.checkedAt);
+      const status = entry?.status;
+
+      if (!Number.isFinite(checkedAt)) {
+        delete history[urlKey];
+        changed = true;
+        continue;
+      }
+
+      if (now - checkedAt > INSPECTION_HISTORY_TTL_MS) {
+        delete history[urlKey];
+        changed = true;
+        continue;
+      }
+
+      if (status !== "indexed" && status !== "not_indexed") {
+        delete history[urlKey];
+        changed = true;
+      }
+    }
+
+    return { history, changed };
+  }
+
+  async function loadInspectionHistoryMap() {
+    try {
+      const stored = await chrome.storage.local.get(STORAGE_KEY_INSPECTION_HISTORY);
+      const { history, changed } = pruneInspectionHistoryRecords(stored?.[STORAGE_KEY_INSPECTION_HISTORY]);
+
+      if (changed) {
+        await chrome.storage.local.set({
+          [STORAGE_KEY_INSPECTION_HISTORY]: history
+        });
+      }
+
+      return history;
+    } catch {
+      return {};
+    }
   }
 
   async function loadSites() {
@@ -682,11 +743,43 @@
         color: #0f172a;
       }
 
+      #${PANEL_ID} .cg2-feed-item-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
       #${PANEL_ID} .cg2-feed-item-title {
         display: block;
+        flex: 1;
         font-size: 12px;
         font-weight: 700;
         line-height: 1.5;
+      }
+
+      #${PANEL_ID} .cg2-feed-item-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        white-space: nowrap;
+        padding: 2px 7px;
+        border-radius: 999px;
+        font-size: 10px;
+        font-weight: 800;
+        border: 1px solid transparent;
+      }
+
+      #${PANEL_ID} .cg2-feed-item-badge.cg2-indexed {
+        background: #dcfce7;
+        color: #166534;
+        border-color: #bbf7d0;
+      }
+
+      #${PANEL_ID} .cg2-feed-item-badge.cg2-not-indexed {
+        background: #fee2e2;
+        color: #991b1b;
+        border-color: #fecaca;
       }
 
       #${PANEL_ID} .cg2-feed-item-date {
@@ -790,7 +883,7 @@
     return button;
   }
 
-  function renderFeedItems(feedListEl, inputEl, panel, site, state) {
+  function renderFeedItems(feedListEl, inputEl, panel, site, state, inspectionHistoryByUrl = {}) {
     feedListEl.innerHTML = "";
 
     state.items = normalizeFeedItems(state.items);
@@ -814,12 +907,31 @@
       link.className = "cg2-feed-item";
       link.href = "#";
       link.innerHTML = `
-        <span class="cg2-feed-item-title"></span>
+        <span class="cg2-feed-item-head">
+          <span class="cg2-feed-item-title"></span>
+          <span class="cg2-feed-item-badge"></span>
+        </span>
         <span class="cg2-feed-item-date"></span>
       `;
 
       link.querySelector(".cg2-feed-item-title").textContent = item.title;
       link.querySelector(".cg2-feed-item-date").textContent = formatDateText(item.publishedAt) || item.link;
+
+      const badgeEl = link.querySelector(".cg2-feed-item-badge");
+      if (badgeEl instanceof HTMLSpanElement) {
+        const historyKey = normalizeUrlForHistory(item.link);
+        const historyEntry = inspectionHistoryByUrl[historyKey];
+
+        if (historyEntry?.status === "indexed") {
+          badgeEl.textContent = "색인됨";
+          badgeEl.classList.add("cg2-indexed");
+        } else if (historyEntry?.status === "not_indexed") {
+          badgeEl.textContent = "미색인";
+          badgeEl.classList.add("cg2-not-indexed");
+        } else {
+          badgeEl.remove();
+        }
+      }
 
       link.addEventListener("click", event => {
         event.preventDefault();
@@ -862,7 +974,7 @@
     prevButton.addEventListener("click", () => {
       if (state.loadingMore || currentPage <= 0) return;
       state.pageIndex = currentPage - 1;
-      renderFeedItems(feedListEl, inputEl, panel, site, state);
+      renderFeedItems(feedListEl, inputEl, panel, site, state, inspectionHistoryByUrl);
     });
 
     nextButton.addEventListener("click", async () => {
@@ -870,14 +982,14 @@
 
       if (currentPage < totalPages - 1) {
         state.pageIndex = currentPage + 1;
-        renderFeedItems(feedListEl, inputEl, panel, site, state);
+        renderFeedItems(feedListEl, inputEl, panel, site, state, inspectionHistoryByUrl);
         return;
       }
 
       if (!state.hasMore) return;
 
       state.loadingMore = true;
-      renderFeedItems(feedListEl, inputEl, panel, site, state);
+      renderFeedItems(feedListEl, inputEl, panel, site, state, inspectionHistoryByUrl);
       setStatus(panel, `${site.label || site.propertyValue} RSS 이전 포스팅을 추가로 불러오는 중입니다.`);
 
       try {
@@ -896,7 +1008,7 @@
       } finally {
         state.loadingMore = false;
         setFeedState(site, state);
-        renderFeedItems(feedListEl, inputEl, panel, site, state);
+        renderFeedItems(feedListEl, inputEl, panel, site, state, inspectionHistoryByUrl);
       }
     });
 
@@ -942,6 +1054,7 @@
     }
 
     setStatus(panel, `현재 선택된 속성 ${sites.length}개를 불러왔습니다.`);
+    const inspectionHistoryByUrl = await loadInspectionHistoryMap();
 
     for (const site of sites) {
       const card = document.createElement("div");
@@ -962,13 +1075,13 @@
       if (feedListEl) {
         const existingState = getFeedState(site);
         if (existingState?.items?.length) {
-          renderFeedItems(feedListEl, inputEl, panel, site, existingState);
+          renderFeedItems(feedListEl, inputEl, panel, site, existingState, inspectionHistoryByUrl);
         } else {
           const cachedItems = await loadCachedFeedItems(site);
           if (cachedItems.length > 0) {
             const cachedState = createFeedState(cachedItems);
             setFeedState(site, cachedState);
-            renderFeedItems(feedListEl, inputEl, panel, site, cachedState);
+            renderFeedItems(feedListEl, inputEl, panel, site, cachedState, inspectionHistoryByUrl);
           }
         }
       }
@@ -1021,7 +1134,7 @@
 
           const state = createFeedState(items, feedUrl, nextFeedUrl);
           setFeedState(site, state);
-          renderFeedItems(feedListEl, inputEl, panel, site, state);
+          renderFeedItems(feedListEl, inputEl, panel, site, state, inspectionHistoryByUrl);
           await saveCachedFeedItems(site, state.items);
           setStatus(panel, `RSS 최신 글 ${Math.min(FEED_PAGE_SIZE, state.items.length)}개를 먼저 표시합니다.`);
         } catch {
@@ -1067,10 +1180,10 @@
 
     chrome.storage.onChanged.addListener((changes, areaName) => {
       if (areaName !== "local") return;
-      if (!changes[STORAGE_KEY_FEED_CACHE]) return;
+      if (!changes[STORAGE_KEY_FEED_CACHE] && !changes[STORAGE_KEY_INSPECTION_HISTORY]) return;
 
       refreshPanel()
-        .catch(() => setStatus(panel, "RSS 목록을 새로고침하지 못했습니다.", true));
+        .catch(() => setStatus(panel, "목록을 새로고침하지 못했습니다.", true));
     });
 
     let lastHref = window.location.href;

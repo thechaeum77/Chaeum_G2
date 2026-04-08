@@ -1,6 +1,7 @@
 (() => {
   const MESSAGE_TYPE_NOTIFY = "chaeum-g2-notify";
   const STORAGE_KEY_PENDING_INSPECT = "pendingInspectRequest";
+  const STORAGE_KEY_INSPECTION_HISTORY = "inspectionHistoryByUrl";
   const REQUEST_BUTTON_KEYWORDS = [
     "색인 생성 요청",
     "requestindexing"
@@ -16,6 +17,7 @@
     "urlisnotongoogle",
     "pagenotindexed"
   ];
+  const INSPECTION_HISTORY_TTL_MS = 90 * 24 * 60 * 60 * 1000;
   const HANDLED_TARGET_TTL_MS = 3 * 60 * 1000;
 
   let requestFlowActive = false;
@@ -40,8 +42,73 @@
     }
   }
 
+  function normalizeUrlForHistory(value) {
+    try {
+      const parsed = new URL(String(value || ""));
+      parsed.hash = "";
+      return parsed.href;
+    } catch {
+      return "";
+    }
+  }
+
   function buildTargetKey(resourceId, targetUrl) {
     return `${normalizeText(resourceId)}|${normalizeUrlForCompare(targetUrl)}`;
+  }
+
+  function pruneInspectionHistoryRecords(historyByUrl) {
+    const now = Date.now();
+    const history = historyByUrl && typeof historyByUrl === "object"
+      ? { ...historyByUrl }
+      : {};
+    let changed = false;
+
+    for (const [urlKey, entry] of Object.entries(history)) {
+      const checkedAt = Number(entry?.checkedAt);
+      const status = entry?.status;
+
+      if (!Number.isFinite(checkedAt)) {
+        delete history[urlKey];
+        changed = true;
+        continue;
+      }
+
+      if (now - checkedAt > INSPECTION_HISTORY_TTL_MS) {
+        delete history[urlKey];
+        changed = true;
+        continue;
+      }
+
+      if (status !== "indexed" && status !== "not_indexed") {
+        delete history[urlKey];
+        changed = true;
+      }
+    }
+
+    return { history, changed };
+  }
+
+  async function saveInspectionHistoryStatus(targetUrl, status) {
+    if (status !== "indexed" && status !== "not_indexed") return;
+
+    const urlKey = normalizeUrlForHistory(targetUrl);
+    if (!urlKey) return;
+
+    try {
+      const stored = await chrome.storage.local.get(STORAGE_KEY_INSPECTION_HISTORY);
+      const { history } = pruneInspectionHistoryRecords(stored?.[STORAGE_KEY_INSPECTION_HISTORY]);
+
+      history[urlKey] = {
+        status,
+        checkedAt: Date.now()
+      };
+
+      await chrome.storage.local.set({
+        [STORAGE_KEY_INSPECTION_HISTORY]: history
+      });
+    } catch {
+      // Ignore history persistence failures.
+    }
   }
 
   function pruneHandledTargetCache() {
@@ -253,6 +320,7 @@
         const inspectionState = detectInspectionState();
 
         if (inspectionState === "indexed") {
+          await saveInspectionHistoryStatus(targetUrl, "indexed");
           await clearPendingInspectRequest();
           markHandledTarget(targetKey);
           await notify("채움 G2", "이미 색인된 URL입니다. 추가 요청 없이 넘어가셔도 됩니다.");
@@ -261,6 +329,7 @@
 
         const requestButton = findRequestIndexingButton();
         if (inspectionState === "not_indexed") {
+          await saveInspectionHistoryStatus(targetUrl, "not_indexed");
           await clearPendingInspectRequest();
           markHandledTarget(targetKey);
 
