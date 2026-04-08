@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "채움 G2 - Search Console 패널",
+  "version": "2.0.0",
+  "description": "저장한 블로그 목록을 Search Console 우측 패널에 표시하고 URL 검사 및 색인 생성 요청을 빠르게 실행합니다.",
+  "permissions": [
+    "storage",
+    "notifications"
+  ],
+  "host_permissions": [
+    "https://search.google.com/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Chaeum G2",
+    "default_icon": {
+      "16": "icon/icon16.png",
+      "48": "icon/icon48.png",
+      "128": "icon/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://search.google.com/search-console*",
+        "https://search.google.com/search-console/*"
+      ],
+      "js": [
+        "content-gsc-autofill.js",
+        "content-gsc-panel.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icon/icon16.png",
+    "48": "icon/icon48.png",
+    "128": "icon/icon128.png"
+  }
+}
