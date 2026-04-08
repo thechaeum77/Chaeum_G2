@@ -6,9 +6,19 @@
   const STYLE_ID = "chaeum-g2-panel-style";
   const TOGGLE_BUTTON_ID = "chaeum-g2-toggle";
   const PANEL_HIDDEN_CLASS = "cg2-hidden";
+  const INSPECT_BUTTON_FOCUS_CLASS = "cg2-site-button-focus";
+  const FEED_PAGE_SIZE = 10;
+  const FEED_CACHE_LIMIT = 200;
+  const feedStateByResource = new Map();
 
   function sanitizeText(value) {
     return typeof value === "string" ? value.trim() : "";
+  }
+
+  function normalizeText(value) {
+    return String(value || "")
+      .toLowerCase()
+      .replace(/\s+/g, "");
   }
 
   async function loadSites() {
@@ -43,7 +53,7 @@
       const cache = stored?.[STORAGE_KEY_FEED_CACHE];
       const entry = cache?.[buildResourceId(site)];
       if (!entry || !Array.isArray(entry.items)) return [];
-      return entry.items;
+      return normalizeFeedItems(entry.items);
     } catch {
       return [];
     }
@@ -57,7 +67,7 @@
         : {};
 
       cache[buildResourceId(site)] = {
-        items: Array.isArray(items) ? items.slice(0, 8) : [],
+        items: normalizeFeedItems(items).slice(0, FEED_CACHE_LIMIT),
         savedAt: Date.now()
       };
 
@@ -204,14 +214,114 @@
     return candidates;
   }
 
+  function buildFeedStateKey(site) {
+    return buildResourceId(site);
+  }
+
+  function getFeedState(site) {
+    return feedStateByResource.get(buildFeedStateKey(site)) || null;
+  }
+
+  function setFeedState(site, state) {
+    feedStateByResource.set(buildFeedStateKey(site), state);
+  }
+
+  function buildFeedPageCandidates(feedUrl, pageNumber, pageSize, hintedNextUrl = "") {
+    const candidates = [];
+    const pushCandidate = value => {
+      const candidate = sanitizeText(value);
+      if (!candidate || candidates.includes(candidate)) return;
+      candidates.push(candidate);
+    };
+
+    if (pageNumber <= 1) {
+      pushCandidate(feedUrl);
+      return candidates;
+    }
+
+    pushCandidate(hintedNextUrl);
+
+    try {
+      const baseUrl = new URL(feedUrl);
+      const startIndex = (pageNumber - 1) * pageSize + 1;
+      const offset = (pageNumber - 1) * pageSize;
+
+      const pagedUrl = new URL(baseUrl.href);
+      pagedUrl.searchParams.set("paged", String(pageNumber));
+      pushCandidate(pagedUrl.toString());
+
+      const pageUrl = new URL(baseUrl.href);
+      pageUrl.searchParams.set("page", String(pageNumber));
+      pushCandidate(pageUrl.toString());
+
+      const startIndexUrl = new URL(baseUrl.href);
+      startIndexUrl.searchParams.set("start-index", String(startIndex));
+      if (!startIndexUrl.searchParams.has("max-results")) {
+        startIndexUrl.searchParams.set("max-results", String(pageSize));
+      }
+      pushCandidate(startIndexUrl.toString());
+
+      const offsetUrl = new URL(baseUrl.href);
+      offsetUrl.searchParams.set("offset", String(offset));
+      if (!offsetUrl.searchParams.has("limit")) {
+        offsetUrl.searchParams.set("limit", String(pageSize));
+      }
+      pushCandidate(offsetUrl.toString());
+
+      const trimmedPath = baseUrl.pathname.endsWith("/")
+        ? baseUrl.pathname.slice(0, -1)
+        : baseUrl.pathname;
+
+      if (/\/feed$/i.test(trimmedPath)) {
+        pushCandidate(`${baseUrl.origin}${trimmedPath}/page/${pageNumber}/`);
+        pushCandidate(`${baseUrl.origin}${trimmedPath}/?paged=${pageNumber}`);
+      }
+    } catch {
+      // Ignore invalid feed URLs.
+    }
+
+    return candidates;
+  }
+
+  function resolveUrl(rawUrl, baseUrl = "") {
+    const text = sanitizeText(rawUrl);
+    if (!text) return "";
+
+    try {
+      return new URL(text, baseUrl || window.location.href).toString();
+    } catch {
+      return text;
+    }
+  }
+
+  function extractNextFeedUrl(xml, sourceUrl) {
+    const linkElements = Array.from(xml.getElementsByTagName("*"))
+      .filter(element => element.localName?.toLowerCase() === "link");
+
+    for (const element of linkElements) {
+      const rel = normalizeText(element.getAttribute("rel") || "");
+      if (rel !== "next") continue;
+
+      const href = element.getAttribute("href") || element.textContent;
+      const nextUrl = resolveUrl(href, sourceUrl);
+      if (nextUrl) return nextUrl;
+    }
+
+    return "";
+  }
+
   async function fetchFeedItemsForSite(site) {
     const candidates = buildFeedCandidates(site);
 
     for (const feedUrl of candidates) {
       try {
-        const items = await fetchFeedItems(feedUrl);
-        if (items.length > 0) {
-          return { items, feedUrl };
+        const result = await fetchFeedItems(feedUrl);
+        if (result.items.length > 0) {
+          return {
+            items: result.items,
+            feedUrl,
+            nextFeedUrl: result.nextFeedUrl
+          };
         }
       } catch {
         // Try the next RSS candidate.
@@ -219,6 +329,60 @@
     }
 
     throw new Error("feed_fetch_failed");
+  }
+
+  function createFeedState(items, feedUrl = "", nextFeedUrl = "") {
+    const normalizedItems = normalizeFeedItems(items);
+    return {
+      items: normalizedItems,
+      pageIndex: 0,
+      feedUrl: sanitizeText(feedUrl),
+      nextFeedUrl: sanitizeText(nextFeedUrl),
+      nextPageNumber: 2,
+      loadingMore: false,
+      hasMore: normalizedItems.length >= FEED_PAGE_SIZE || Boolean(nextFeedUrl)
+    };
+  }
+
+  async function fetchMoreFeedItemsForState(site, state) {
+    if (!state.feedUrl) {
+      state.hasMore = false;
+      return 0;
+    }
+
+    const existingLinks = new Set(state.items.map(item => item.link));
+    const candidateUrls = buildFeedPageCandidates(
+      state.feedUrl,
+      state.nextPageNumber,
+      FEED_PAGE_SIZE,
+      state.nextFeedUrl
+    );
+
+    for (const candidateUrl of candidateUrls) {
+      try {
+        const result = await fetchFeedItems(candidateUrl);
+        const newItems = normalizeFeedItems(result.items)
+          .filter(item => !existingLinks.has(item.link));
+
+        if (newItems.length > 0) {
+          state.items = normalizeFeedItems([...state.items, ...newItems]).slice(0, FEED_CACHE_LIMIT);
+          state.nextPageNumber += 1;
+          state.nextFeedUrl = sanitizeText(result.nextFeedUrl);
+          state.hasMore = newItems.length >= FEED_PAGE_SIZE || Boolean(state.nextFeedUrl);
+          await saveCachedFeedItems(site, state.items);
+          return newItems.length;
+        }
+
+        if (result.nextFeedUrl) {
+          state.nextFeedUrl = sanitizeText(result.nextFeedUrl);
+        }
+      } catch {
+        // Try the next pagination candidate URL.
+      }
+    }
+
+    state.hasMore = false;
+    return 0;
   }
 
   function formatDateText(value) {
@@ -234,11 +398,58 @@
     }).format(date);
   }
 
-  function parseFeedXml(xmlText) {
+  function getPublishedTime(value) {
+    if (!value) return null;
+
+    const time = new Date(value).getTime();
+    return Number.isNaN(time) ? null : time;
+  }
+
+  function normalizeFeedItems(items) {
+    if (!Array.isArray(items)) return [];
+
+    const seenLinks = new Set();
+    const normalized = [];
+
+    for (const rawItem of items) {
+      const link = sanitizeText(rawItem?.link);
+      if (!link || seenLinks.has(link)) continue;
+      seenLinks.add(link);
+
+      normalized.push({
+        title: sanitizeText(rawItem?.title) || "제목 없음",
+        link,
+        publishedAt: sanitizeText(rawItem?.publishedAt)
+      });
+    }
+
+    return normalized
+      .map((item, index) => ({
+        ...item,
+        __index: index,
+        __publishedTime: getPublishedTime(item.publishedAt)
+      }))
+      .sort((a, b) => {
+        if (a.__publishedTime == null && b.__publishedTime == null) {
+          return a.__index - b.__index;
+        }
+        if (a.__publishedTime == null) return 1;
+        if (b.__publishedTime == null) return -1;
+        return b.__publishedTime - a.__publishedTime;
+      })
+      .map(({ __index, __publishedTime, ...item }) => item);
+  }
+
+  function parseFeedXml(xmlText, sourceUrl = "") {
     const xml = new DOMParser().parseFromString(xmlText, "text/xml");
     if (xml.querySelector("parsererror")) {
-      return [];
+      return {
+        items: [],
+        nextFeedUrl: ""
+      };
     }
+
+    const nextFeedUrl = extractNextFeedUrl(xml, sourceUrl);
 
     const rssItems = Array.from(xml.querySelectorAll("item")).map(item => ({
       title: sanitizeText(item.querySelector("title")?.textContent) || "제목 없음",
@@ -247,7 +458,10 @@
     }));
 
     if (rssItems.length > 0) {
-      return rssItems.filter(item => item.link).slice(0, 8);
+      return {
+        items: normalizeFeedItems(rssItems),
+        nextFeedUrl
+      };
     }
 
     const atomItems = Array.from(xml.querySelectorAll("entry")).map(entry => {
@@ -261,7 +475,10 @@
       };
     });
 
-    return atomItems.filter(item => item.link).slice(0, 8);
+    return {
+      items: normalizeFeedItems(atomItems),
+      nextFeedUrl
+    };
   }
 
   async function fetchFeedItems(feedUrl) {
@@ -274,7 +491,7 @@
       throw new Error("feed_fetch_failed");
     }
 
-    return parseFeedXml(response.text);
+    return parseFeedXml(response.text, feedUrl);
   }
 
   function injectStyle() {
@@ -285,11 +502,12 @@
     style.textContent = `
       #${PANEL_ID} {
         position: fixed;
-        top: 110px;
+        top: 96px;
         right: 18px;
+        bottom: 84px;
         z-index: 2147483646;
         width: 320px;
-        max-height: calc(100vh - 140px);
+        max-height: none;
         display: flex;
         flex-direction: column;
         background: rgba(255, 255, 255, 0.96);
@@ -420,6 +638,11 @@
       #${PANEL_ID} .cg2-site-button {
         background: #0f766e;
         color: #fff;
+        transition: box-shadow 0.2s ease;
+      }
+
+      #${PANEL_ID} .cg2-site-button.${INSPECT_BUTTON_FOCUS_CLASS} {
+        box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.3);
       }
 
       #${PANEL_ID} .cg2-feed-button {
@@ -442,6 +665,11 @@
         display: grid;
         gap: 8px;
         margin-top: 10px;
+      }
+
+      #${PANEL_ID} .cg2-feed-items {
+        display: grid;
+        gap: 8px;
       }
 
       #${PANEL_ID} .cg2-feed-item {
@@ -473,6 +701,38 @@
         font-size: 12px;
         color: #64748b;
         line-height: 1.6;
+      }
+
+      #${PANEL_ID} .cg2-feed-pagination {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      #${PANEL_ID} .cg2-feed-page-button {
+        flex: 1;
+        border: 1px solid #cbd5e1;
+        border-radius: 8px;
+        background: #fff;
+        color: #0f172a;
+        padding: 8px 10px;
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      #${PANEL_ID} .cg2-feed-page-button:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+
+      #${PANEL_ID} .cg2-feed-page-text {
+        min-width: 56px;
+        text-align: center;
+        font-size: 11px;
+        color: #64748b;
+        font-weight: 700;
       }
 
       @media (max-width: 1440px) {
@@ -530,10 +790,26 @@
     return button;
   }
 
-  function renderFeedItems(feedListEl, inputEl, panel, items) {
+  function renderFeedItems(feedListEl, inputEl, panel, site, state) {
     feedListEl.innerHTML = "";
 
-    for (const item of items) {
+    state.items = normalizeFeedItems(state.items);
+    if (!state.items.length) {
+      feedListEl.innerHTML = `<div class="cg2-feed-empty">RSS에서 글을 찾지 못했습니다.</div>`;
+      return;
+    }
+
+    const totalPages = Math.max(1, Math.ceil(state.items.length / FEED_PAGE_SIZE));
+    const currentPage = Math.min(Math.max(state.pageIndex || 0, 0), totalPages - 1);
+    state.pageIndex = currentPage;
+
+    const startIndex = currentPage * FEED_PAGE_SIZE;
+    const visibleItems = state.items.slice(startIndex, startIndex + FEED_PAGE_SIZE);
+
+    const itemsWrap = document.createElement("div");
+    itemsWrap.className = "cg2-feed-items";
+
+    for (const item of visibleItems) {
       const link = document.createElement("a");
       link.className = "cg2-feed-item";
       link.href = "#";
@@ -548,11 +824,103 @@
       link.addEventListener("click", event => {
         event.preventDefault();
         inputEl.value = item.link;
-        setStatus(panel, "RSS 글 URL을 입력창에 채웠습니다. 같은 카드의 검사 실행 버튼을 누르세요.");
+        moveToInspectButton(feedListEl);
+        setStatus(panel, "RSS 글 URL을 입력창에 채웠습니다. 같은 카드의 포스팅 검사 버튼 위치로 이동했습니다.");
       });
 
-      feedListEl.appendChild(link);
+      itemsWrap.appendChild(link);
     }
+
+    feedListEl.appendChild(itemsWrap);
+
+    const paginationEl = document.createElement("div");
+    paginationEl.className = "cg2-feed-pagination";
+    paginationEl.innerHTML = `
+      <button class="cg2-feed-page-button cg2-feed-prev" type="button">이전</button>
+      <span class="cg2-feed-page-text"></span>
+      <button class="cg2-feed-page-button cg2-feed-next" type="button">다음</button>
+    `;
+
+    const prevButton = paginationEl.querySelector(".cg2-feed-prev");
+    const nextButton = paginationEl.querySelector(".cg2-feed-next");
+    const pageText = paginationEl.querySelector(".cg2-feed-page-text");
+
+    if (
+      !(prevButton instanceof HTMLButtonElement) ||
+      !(nextButton instanceof HTMLButtonElement) ||
+      !(pageText instanceof HTMLSpanElement)
+    ) {
+      return;
+    }
+
+    const hasLoadedNextPage = currentPage < totalPages - 1;
+    prevButton.disabled = state.loadingMore || currentPage <= 0;
+    nextButton.disabled = state.loadingMore || (!hasLoadedNextPage && !state.hasMore);
+    nextButton.textContent = state.loadingMore ? "불러오는 중..." : "다음";
+    pageText.textContent = `${currentPage + 1}/${totalPages}${state.hasMore ? "+" : ""}`;
+
+    prevButton.addEventListener("click", () => {
+      if (state.loadingMore || currentPage <= 0) return;
+      state.pageIndex = currentPage - 1;
+      renderFeedItems(feedListEl, inputEl, panel, site, state);
+    });
+
+    nextButton.addEventListener("click", async () => {
+      if (state.loadingMore) return;
+
+      if (currentPage < totalPages - 1) {
+        state.pageIndex = currentPage + 1;
+        renderFeedItems(feedListEl, inputEl, panel, site, state);
+        return;
+      }
+
+      if (!state.hasMore) return;
+
+      state.loadingMore = true;
+      renderFeedItems(feedListEl, inputEl, panel, site, state);
+      setStatus(panel, `${site.label || site.propertyValue} RSS 이전 포스팅을 추가로 불러오는 중입니다.`);
+
+      try {
+        const addedCount = await fetchMoreFeedItemsForState(site, state);
+
+        if (addedCount > 0) {
+          const newTotalPages = Math.max(1, Math.ceil(state.items.length / FEED_PAGE_SIZE));
+          state.pageIndex = Math.min(currentPage + 1, newTotalPages - 1);
+          setStatus(panel, `RSS 포스팅 ${addedCount}개를 추가로 불러왔습니다.`);
+        } else {
+          setStatus(panel, "더 불러올 RSS 포스팅이 없습니다.");
+        }
+      } catch {
+        state.hasMore = false;
+        setStatus(panel, "추가 RSS 포스팅을 불러오지 못했습니다.", true);
+      } finally {
+        state.loadingMore = false;
+        setFeedState(site, state);
+        renderFeedItems(feedListEl, inputEl, panel, site, state);
+      }
+    });
+
+    feedListEl.appendChild(paginationEl);
+  }
+
+  function moveToInspectButton(feedListEl) {
+    const siteCard = feedListEl.closest(".cg2-site");
+    if (!siteCard) return;
+
+    const inspectButton = siteCard.querySelector(".cg2-site-button");
+    if (!(inspectButton instanceof HTMLButtonElement)) return;
+
+    inspectButton.scrollIntoView({
+      behavior: "smooth",
+      block: "center",
+      inline: "nearest"
+    });
+    inspectButton.focus({ preventScroll: true });
+    inspectButton.classList.add(INSPECT_BUTTON_FOCUS_CLASS);
+
+    window.setTimeout(() => {
+      inspectButton.classList.remove(INSPECT_BUTTON_FOCUS_CLASS);
+    }, 900);
   }
 
   async function renderSites(panel, sites) {
@@ -581,7 +949,7 @@
       card.innerHTML = `
         <p class="cg2-site-title"></p>
         <p class="cg2-site-meta"></p>
-        <button class="cg2-site-button" type="button">이 블로그로 검사 실행</button>
+        <button class="cg2-site-button" type="button">이 포스팅 검사</button>
         <button class="cg2-feed-button" type="button">RSS 최신 글 불러오기</button>
         <div class="cg2-feed-list"></div>
       `;
@@ -592,9 +960,16 @@
       const feedListEl = card.querySelector(".cg2-feed-list");
 
       if (feedListEl) {
-        const cachedItems = await loadCachedFeedItems(site);
-        if (cachedItems.length > 0) {
-          renderFeedItems(feedListEl, inputEl, panel, cachedItems);
+        const existingState = getFeedState(site);
+        if (existingState?.items?.length) {
+          renderFeedItems(feedListEl, inputEl, panel, site, existingState);
+        } else {
+          const cachedItems = await loadCachedFeedItems(site);
+          if (cachedItems.length > 0) {
+            const cachedState = createFeedState(cachedItems);
+            setFeedState(site, cachedState);
+            renderFeedItems(feedListEl, inputEl, panel, site, cachedState);
+          }
         }
       }
 
@@ -636,7 +1011,7 @@
         setStatus(panel, `${site.label || site.propertyValue} RSS를 불러오는 중입니다.`);
 
         try {
-          const { items } = await fetchFeedItemsForSite(site);
+          const { items, feedUrl, nextFeedUrl } = await fetchFeedItemsForSite(site);
 
           if (!items.length) {
             feedListEl.innerHTML = `<div class="cg2-feed-empty">RSS에서 글을 찾지 못했습니다.</div>`;
@@ -644,9 +1019,11 @@
             return;
           }
 
-          renderFeedItems(feedListEl, inputEl, panel, items);
-          await saveCachedFeedItems(site, items);
-          setStatus(panel, `RSS 최신 글 ${items.length}개를 불러왔습니다.`);
+          const state = createFeedState(items, feedUrl, nextFeedUrl);
+          setFeedState(site, state);
+          renderFeedItems(feedListEl, inputEl, panel, site, state);
+          await saveCachedFeedItems(site, state.items);
+          setStatus(panel, `RSS 최신 글 ${Math.min(FEED_PAGE_SIZE, state.items.length)}개를 먼저 표시합니다.`);
         } catch {
           feedListEl.innerHTML = `<div class="cg2-feed-empty">RSS를 불러오지 못했습니다.</div>`;
           setStatus(panel, "RSS 요청에 실패했습니다. RSS 주소를 확인해 주세요.", true);

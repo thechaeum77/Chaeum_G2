@@ -5,12 +5,6 @@
     "색인 생성 요청",
     "requestindexing"
   ];
-  const CONFIRM_KEYWORDS = [
-    "요청",
-    "확인",
-    "submit",
-    "request"
-  ];
   const INDEXED_KEYWORDS = [
     "url이google에등록되어있음",
     "urlisongoogle",
@@ -22,8 +16,11 @@
     "urlisnotongoogle",
     "pagenotindexed"
   ];
+  const HANDLED_TARGET_TTL_MS = 3 * 60 * 1000;
 
   let requestFlowActive = false;
+  let activeTargetKey = "";
+  const handledTargetTimestamps = new Map();
 
   function sleep(ms) {
     return new Promise(resolve => window.setTimeout(resolve, ms));
@@ -33,6 +30,39 @@
     return String(text || "")
       .toLowerCase()
       .replace(/\s+/g, "");
+  }
+
+  function normalizeUrlForCompare(value) {
+    try {
+      return new URL(String(value || "")).href;
+    } catch {
+      return normalizeText(value);
+    }
+  }
+
+  function buildTargetKey(resourceId, targetUrl) {
+    return `${normalizeText(resourceId)}|${normalizeUrlForCompare(targetUrl)}`;
+  }
+
+  function pruneHandledTargetCache() {
+    const now = Date.now();
+    for (const [key, timestamp] of handledTargetTimestamps) {
+      if (now - timestamp > HANDLED_TARGET_TTL_MS) {
+        handledTargetTimestamps.delete(key);
+      }
+    }
+  }
+
+  function isRecentlyHandledTarget(targetKey) {
+    pruneHandledTargetCache();
+    const lastHandledAt = handledTargetTimestamps.get(targetKey);
+    if (!lastHandledAt) return false;
+    return Date.now() - lastHandledAt <= HANDLED_TARGET_TTL_MS;
+  }
+
+  function markHandledTarget(targetKey) {
+    pruneHandledTargetCache();
+    handledTargetTimestamps.set(targetKey, Date.now());
   }
 
   function isVisibleElement(element) {
@@ -110,13 +140,6 @@
     input.dispatchEvent(new KeyboardEvent("keyup", eventInit));
   }
 
-  function clickElement(element) {
-    element.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
-    element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-    element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-    element.click();
-  }
-
   function elementMatchesKeywords(element, keywords) {
     const text = normalizeText(element.textContent || "");
     const label = normalizeText(element.getAttribute("aria-label") || "");
@@ -134,24 +157,6 @@
     return candidates.find(
       element => isClickable(element) && elementMatchesKeywords(element, REQUEST_BUTTON_KEYWORDS)
     ) || null;
-  }
-
-  function findDialogConfirmButton() {
-    const dialogs = [];
-    collectCandidatesInRoot(document, "[role='dialog']", dialogs);
-
-    for (const dialog of dialogs) {
-      if (!isVisibleElement(dialog)) continue;
-
-      const buttons = Array.from(dialog.querySelectorAll("button, [role='button']"));
-      const button = buttons.find(
-        candidate => isClickable(candidate) && elementMatchesKeywords(candidate, CONFIRM_KEYWORDS)
-      );
-
-      if (button) return button;
-    }
-
-    return null;
   }
 
   function detectInspectionState() {
@@ -223,41 +228,52 @@
 
     if (!targetUrl) return;
 
-    const input = findInspectionInput();
-    if (!input) return;
-
-    if (normalizeText(input.value) !== normalizeText(targetUrl)) {
-      input.focus();
-      setInputValue(input, targetUrl);
-      pressEnter(input);
-      await sleep(800);
+    const targetKey = buildTargetKey(getCurrentResourceId(), targetUrl);
+    if (requestFlowActive) {
+      if (activeTargetKey === targetKey) return;
+      return;
     }
+    if (isRecentlyHandledTarget(targetKey)) return;
 
-    if (requestFlowActive) return;
     requestFlowActive = true;
+    activeTargetKey = targetKey;
 
     try {
+      const input = findInspectionInput();
+      if (!input) return;
+
+      if (normalizeUrlForCompare(input.value) !== normalizeUrlForCompare(targetUrl)) {
+        input.focus();
+        setInputValue(input, targetUrl);
+        pressEnter(input);
+        await sleep(800);
+      }
+
       for (let attempt = 0; attempt < 180; attempt += 1) {
         const inspectionState = detectInspectionState();
 
         if (inspectionState === "indexed") {
           await clearPendingInspectRequest();
-          await notify("채움 G2", "이미 색인된 URL이라 색인 생성 요청을 생략했습니다.");
+          markHandledTarget(targetKey);
+          await notify("채움 G2", "이미 색인된 URL입니다. 추가 요청 없이 넘어가셔도 됩니다.");
           return;
         }
 
         const requestButton = findRequestIndexingButton();
-        if (inspectionState === "not_indexed" && requestButton) {
-          clickElement(requestButton);
-          await sleep(500);
-
-          const confirmButton = findDialogConfirmButton();
-          if (confirmButton) {
-            clickElement(confirmButton);
-          }
-
+        if (inspectionState === "not_indexed") {
           await clearPendingInspectRequest();
-          await notify("채움 G2", "색인 생성 요청 버튼까지 자동으로 처리했습니다.");
+          markHandledTarget(targetKey);
+
+          if (requestButton) {
+            requestButton.scrollIntoView({
+              behavior: "smooth",
+              block: "center",
+              inline: "nearest"
+            });
+            await notify("채움 G2", "미색인 상태입니다. '색인 생성 요청' 버튼을 수동으로 눌러주세요.");
+          } else {
+            await notify("채움 G2", "미색인 상태를 확인했습니다. 색인 생성 요청은 수동으로 진행해 주세요.");
+          }
           return;
         }
 
@@ -265,9 +281,11 @@
       }
 
       await clearPendingInspectRequest();
+      markHandledTarget(targetKey);
       await notify("채움 G2", "URL 검사는 열렸지만 색인 생성 요청 버튼은 찾지 못했습니다.");
     } finally {
       requestFlowActive = false;
+      activeTargetKey = "";
     }
   }
 
